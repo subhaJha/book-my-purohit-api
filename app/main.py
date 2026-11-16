@@ -1,0 +1,219 @@
+from contextlib import asynccontextmanager, closing, contextmanager
+from hashlib import sha256
+import hmac
+import json
+import os
+from pathlib import Path
+import secrets
+import sqlite3
+from threading import Lock
+from time import monotonic
+from typing import Annotated, Literal
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from .models import (
+    STATUS, AcceptQuote, BookingId, BookingPage, Code, NewBooking,
+    PublicBooking, UpdateBooking, today,
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS bookings (
+  id TEXT PRIMARY KEY,
+  request_key TEXT NOT NULL UNIQUE,
+  details TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'requested',
+  revision INTEGER NOT NULL DEFAULT 0,
+  quote TEXT NOT NULL DEFAULT 'null',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+TRANSITIONS = {
+    "requested": {"quoted", "cancelled"},
+    "quoted": {"quoted", "cancelled"},
+    "confirmed": {"completed", "cancelled"},
+}
+
+
+def summary(row):
+    details = json.loads(row["details"])
+    return {
+        "date": details["date"],
+        "ritual": details["ritual"],
+        "customRitual": details.get("customRitual"),
+        "status": row["status"],
+        "revision": row["revision"],
+        "quote": json.loads(row["quote"]),
+    }
+
+
+class Database:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def connect(self):
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def initialize(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self.connect()) as db, db:
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute(SCHEMA)
+
+    @contextmanager
+    def write(self):
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+
+    @staticmethod
+    def get(db, booking_id):
+        row = db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Booking not found")
+        return row
+
+    @classmethod
+    def update(cls, db, row, status, quote):
+        db.execute(
+            "UPDATE bookings SET status = ?, quote = ?, revision = revision + 1 WHERE id = ?",
+            (status, quote, row["id"]),
+        )
+        return summary(cls.get(db, row["id"]))
+
+
+def create_app(database: Path | None = None, password: str | None = None) -> FastAPI:
+    store = Database(database or Path(os.getenv("BOOKING_DB") or ".data/bookings.sqlite"))
+    password = os.getenv("BOOKING_ADMIN_PASSWORD", "") if password is None else password
+    expected = sha256(password.encode()).digest() if len(password) >= 16 else None
+    bearer = HTTPBearer(auto_error=False)
+    rates = {}
+    rates_lock = Lock()
+    minute = -1
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        store.initialize()
+        yield
+
+    app = FastAPI(title="Book My Purohit API", version="1.0.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def private_responses(request, call_next):
+        if request.method in {"POST", "PATCH"}:
+            length = request.headers.get("content-length")
+            if length is not None and (not length.isascii() or not length.isdecimal()):
+                return JSONResponse({"detail": "Invalid request length"}, status_code=400)
+            if length is None or len(length) > 5 or int(length) > 8192:
+                return JSONResponse({"detail": "Request body too large or missing length"}, status_code=413)
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request, exc):
+        # Validation messages exclude the original input and context.
+        errors = [{key: item[key] for key in ("loc", "msg", "type")} for item in exc.errors()]
+        return JSONResponse({"detail": errors}, status_code=422)
+
+    def limit(request: Request, group: str, maximum: int):
+        nonlocal minute
+        address = request.client.host if request.client else "unknown"
+        with rates_lock:
+            current = int(monotonic() // 60)
+            if current != minute:
+                rates.clear()
+                minute = current
+            key = (group, address)
+            count = rates.get(key, 0) + 1
+            rates[key] = count
+        if count > maximum:
+            raise HTTPException(429, "Too many requests", headers={"Retry-After": "60"})
+
+    def require_staff(request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
+        if expected is None:
+            raise HTTPException(503, "Staff access has not been configured")
+        supplied = credentials.credentials if credentials else ""
+        if not hmac.compare_digest(sha256(supplied.encode()).digest(), expected):
+            limit(request, "staff", 12)
+            raise HTTPException(401, "Invalid staff credentials", headers={"WWW-Authenticate": "Bearer"})
+
+    @app.get("/api/health")
+    def health():
+        with closing(store.connect()) as db:
+            db.execute("SELECT 1 FROM bookings LIMIT 1").fetchone()
+        return {"status": "ok"}
+
+    @app.post("/api/bookings", response_model=BookingId)
+    def create_booking(details: NewBooking, request: Request):
+        limit(request, "create", 24)
+        with store.write() as db:
+            previous = db.execute("SELECT id FROM bookings WHERE request_key = ?", (details.key,)).fetchone()
+            if previous:
+                return {"id": previous["id"]}
+            if details.date < today():
+                raise HTTPException(400, "Puja date has passed")
+            booking_id = secrets.token_hex(16)
+            db.execute(
+                "INSERT INTO bookings (id, request_key, details) VALUES (?, ?, ?)",
+                (booking_id, details.key, details.model_dump_json(exclude={"key"})),
+            )
+            return {"id": booking_id}
+
+    @app.get("/api/bookings/{booking_id}", response_model=PublicBooking)
+    def get_booking(booking_id: Code, request: Request):
+        limit(request, "lookup", 180)
+        with closing(store.connect()) as db:
+            return summary(store.get(db, booking_id))
+
+    @app.post("/api/bookings/{booking_id}/accept", response_model=PublicBooking)
+    def accept_quote(booking_id: Code, data: AcceptQuote, request: Request):
+        limit(request, "accept", 40)
+        with store.write() as db:
+            row = store.get(db, booking_id)
+            if row["status"] == "confirmed" and data.revision == row["revision"] - 1:
+                return summary(row)
+            if (row["status"] != "quoted" or row["revision"] != data.revision
+                    or json.loads(row["details"])["date"] < today().isoformat()):
+                raise HTTPException(409, "Quote or booking status changed")
+            return store.update(db, row, "confirmed", row["quote"])
+
+    @app.get("/api/admin", response_model=BookingPage, dependencies=[Depends(require_staff)])
+    def list_bookings(
+        before: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)] = 9_007_199_254_740_991,
+        status: STATUS | Literal[""] | None = None,
+    ):
+        with closing(store.connect()) as db:
+            rows = db.execute(
+                """SELECT rowid AS cursor, * FROM bookings
+                   WHERE rowid < ? AND (? IS NULL OR status = ?)
+                   ORDER BY rowid DESC LIMIT 51""",
+                (before, status or None, status),
+            ).fetchall()
+        return {
+            "bookings": [
+                dict(json.loads(row["details"]), **summary(row), id=row["id"], createdAt=row["created_at"])
+                for row in rows[:50]
+            ],
+            "next": rows[49]["cursor"] if len(rows) > 50 else None,
+        }
+
+    @app.patch("/api/admin/{booking_id}", response_model=PublicBooking, dependencies=[Depends(require_staff)])
+    def update_booking(booking_id: Code, data: UpdateBooking):
+        with store.write() as db:
+            row = store.get(db, booking_id)
+            if row["revision"] != data.revision or data.status not in TRANSITIONS.get(row["status"], set()):
+                raise HTTPException(409, "Booking has changed")
+            quote = data.quote.model_dump_json() if data.status == "quoted" else row["quote"]
+            return store.update(db, row, data.status, quote)
+
+    return app
+
+
+app = create_app()

@@ -5,7 +5,15 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 LANG = Literal["bn", "hi", "en"]
-RITUAL = Literal["griha", "annaprashan", "lakshmi", "saraswati", "other"]
+RITUAL = Literal[
+    "griha", "annaprashan", "lakshmi", "saraswati", "other",
+    "satyanarayan", "shiva", "ganesh", "chandi", "tulsi", "navagraha", "homa",
+    "mangalchandi", "bipadtarini", "durga", "kali", "jagaddhatri", "janmashtami",
+    "shivaratri", "dol", "rath", "manasa", "sheetala", "kartik", "basanti",
+    "nabanna", "wedding", "ashirbad", "namkaran", "hatekhori", "upanayan",
+    "vastushanti", "bhoomi", "vishwakarma", "halkhata", "shop", "vehicle",
+    "shraddha", "tarpan", "pindadaan",
+]
 AREA = Literal["englishBazar", "oldMalda", "other"]
 SLOT = Literal["morning", "afternoon", "evening", "flexible"]
 STATUS = Literal["requested", "quoted", "confirmed", "completed", "cancelled"]
@@ -66,6 +74,7 @@ class UpdateBooking(BaseModel):
     status: Literal["quoted", "completed", "cancelled"]
     revision: Revision
     quote: Quote | None = None
+    purohitId: Code | None = None
 
     @model_validator(mode="after")
     def check_quote(self):
@@ -91,7 +100,11 @@ class PublicBooking(BaseModel):
     quote: Quote | None
 
 
-class AdminBooking(PublicBooking, RequestDetails):
+class AdminUpdateResult(PublicBooking):
+    purohitId: Code | None = None
+
+
+class AdminBooking(AdminUpdateResult, RequestDetails):
     id: Code
     createdAt: str
 

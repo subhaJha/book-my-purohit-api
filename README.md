@@ -36,3 +36,15 @@ For a public deployment, run behind HTTPS with a persistent private database vol
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+## Customer accounts
+
+Customers register and sign in with email and password. Requests created while signed in appear in the customer's booking history. Existing guest bookings remain accessible using their private tracking links. Email verification and password recovery are not implemented.
+
+For an HTTPS deployment, set BOOKING_SECURE_COOKIES=1 so customer session cookies require HTTPS even when the upstream proxy connects over HTTP.
+
+## Purohit portal and staff directory
+
+Staff sign in at /admin in the React app. Use Add new purohit to create a purohit account and give the purohit their credentials privately. Use Purohit list or User list to find and edit existing accounts. Disabling an account revokes its sessions. Staff can set a replacement password for a purohit.
+
+When preparing a quote, choose a roster entry to assign the booking to that account. Purohits sign in at /purohit-portal to see their assigned pujas and statuses. External purohits entered by name have no portal assignment.

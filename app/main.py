@@ -15,8 +15,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .accounts import ACCOUNT_SCHEMA, account_routes, customer
+from .directory import DIRECTORY_SCHEMA, active_purohit, admin_directory, assignment, purohit_routes, set_assignment
 from .models import (
-    STATUS, AcceptQuote, BookingId, BookingPage, Code, NewBooking,
+    STATUS, AcceptQuote, AdminUpdateResult, BookingId, BookingPage, Code, NewBooking,
     PublicBooking, UpdateBooking, today,
 )
 
@@ -64,6 +66,8 @@ class Database:
         with closing(self.connect()) as db, db:
             db.execute("PRAGMA journal_mode = WAL")
             db.execute(SCHEMA)
+            db.executescript(ACCOUNT_SCHEMA)
+            db.executescript(DIRECTORY_SCHEMA)
 
     @contextmanager
     def write(self):
@@ -91,6 +95,9 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
     store = Database(database or Path(os.getenv("BOOKING_DB") or ".data/bookings.sqlite"))
     password = os.getenv("BOOKING_ADMIN_PASSWORD", "") if password is None else password
     expected = sha256(password.encode()).digest() if len(password) >= 16 else None
+    # Short passwords are opt-in for a local developer launch only.
+    local_password = os.getenv("BOOKING_LOCAL_ADMIN_PASSWORD", "") if password == "" else ""
+    local_expected = sha256(local_password.encode()).digest() if local_password else None
     bearer = HTTPBearer(auto_error=False)
     rates = {}
     rates_lock = Lock()
@@ -106,6 +113,8 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
     @app.middleware("http")
     async def private_responses(request, call_next):
         if request.method in {"POST", "PATCH"}:
+            if request.url.path.startswith(("/api/account/", "/api/purohit/")) and request.headers.get("content-type", "").split(";")[0] != "application/json":
+                return JSONResponse({"detail": "JSON required"}, status_code=415)
             length = request.headers.get("content-length")
             if length is not None and (not length.isascii() or not length.isdecimal()):
                 return JSONResponse({"detail": "Invalid request length"}, status_code=400)
@@ -137,12 +146,19 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
             raise HTTPException(429, "Too many requests", headers={"Retry-After": "60"})
 
     def require_staff(request: Request, credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
-        if expected is None:
+        active_password = expected
+        if active_password is None and request.client and request.client.host in {"127.0.0.1", "::1"}:
+            active_password = local_expected
+        if active_password is None:
             raise HTTPException(503, "Staff access has not been configured")
         supplied = credentials.credentials if credentials else ""
-        if not hmac.compare_digest(sha256(supplied.encode()).digest(), expected):
+        if not hmac.compare_digest(sha256(supplied.encode()).digest(), active_password):
             limit(request, "staff", 12)
             raise HTTPException(401, "Invalid staff credentials", headers={"WWW-Authenticate": "Bearer"})
+
+    app.include_router(account_routes(store, limit, summary))
+    app.include_router(admin_directory(store, require_staff))
+    app.include_router(purohit_routes(store, limit, summary))
 
     @app.get("/api/health")
     def health():
@@ -164,6 +180,9 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
                 "INSERT INTO bookings (id, request_key, details) VALUES (?, ?, ?)",
                 (booking_id, details.key, details.model_dump_json(exclude={"key"})),
             )
+            owner = customer(db, request)
+            if owner:
+                db.execute("INSERT INTO booking_owners (booking_id, customer_id) VALUES (?, ?)", (booking_id, owner["id"]))
             return {"id": booking_id}
 
     @app.get("/api/bookings/{booking_id}", response_model=PublicBooking)
@@ -182,6 +201,9 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
             if (row["status"] != "quoted" or row["revision"] != data.revision
                     or json.loads(row["details"])["date"] < today().isoformat()):
                 raise HTTPException(409, "Quote or booking status changed")
+            purohit_id = assignment(db, booking_id)
+            if purohit_id and not active_purohit(db, purohit_id):
+                raise HTTPException(409, "Assigned purohit is no longer available")
             return store.update(db, row, "confirmed", row["quote"])
 
     @app.get("/api/admin", response_model=BookingPage, dependencies=[Depends(require_staff)])
@@ -191,27 +213,38 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
     ):
         with closing(store.connect()) as db:
             rows = db.execute(
-                """SELECT rowid AS cursor, * FROM bookings
-                   WHERE rowid < ? AND (? IS NULL OR status = ?)
-                   ORDER BY rowid DESC LIMIT 51""",
+                """SELECT b.rowid AS cursor, b.*, a.purohit_id FROM bookings b
+                   LEFT JOIN booking_assignments a ON a.booking_id = b.id
+                   WHERE b.rowid < ? AND (? IS NULL OR b.status = ?)
+                   ORDER BY b.rowid DESC LIMIT 51""",
                 (before, status or None, status),
             ).fetchall()
         return {
             "bookings": [
-                dict(json.loads(row["details"]), **summary(row), id=row["id"], createdAt=row["created_at"])
+                dict(json.loads(row["details"]), **summary(row), id=row["id"], createdAt=row["created_at"], purohitId=row["purohit_id"])
                 for row in rows[:50]
             ],
             "next": rows[49]["cursor"] if len(rows) > 50 else None,
         }
 
-    @app.patch("/api/admin/{booking_id}", response_model=PublicBooking, dependencies=[Depends(require_staff)])
+    @app.patch("/api/admin/{booking_id}", response_model=AdminUpdateResult, dependencies=[Depends(require_staff)])
     def update_booking(booking_id: Code, data: UpdateBooking):
         with store.write() as db:
             row = store.get(db, booking_id)
             if row["revision"] != data.revision or data.status not in TRANSITIONS.get(row["status"], set()):
                 raise HTTPException(409, "Booking has changed")
-            quote = data.quote.model_dump_json() if data.status == "quoted" else row["quote"]
-            return store.update(db, row, data.status, quote)
+            quote = row["quote"]
+            purohit_id = assignment(db, booking_id)
+            if data.status == "quoted":
+                purohit_id = data.purohitId if "purohitId" in data.model_fields_set else purohit_id
+                if purohit_id:
+                    purohit = active_purohit(db, purohit_id)
+                    if purohit is None:
+                        raise HTTPException(422, "Select an active purohit")
+                    data.quote.purohit = purohit["name"]
+                set_assignment(db, booking_id, purohit_id)
+                quote = data.quote.model_dump_json()
+            return dict(store.update(db, row, data.status, quote), purohitId=purohit_id)
 
     return app
 

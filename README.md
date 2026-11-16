@@ -48,3 +48,15 @@ For an HTTPS deployment, set BOOKING_SECURE_COOKIES=1 so customer session cookie
 Staff sign in at /admin in the React app. Use Add new purohit to create a purohit account and give the purohit their credentials privately. Use Purohit list or User list to find and edit existing accounts. Disabling an account revokes its sessions. Staff can set a replacement password for a purohit.
 
 When preparing a quote, choose a roster entry to assign the booking to that account. Purohits sign in at /purohit-portal to see their assigned pujas and statuses. External purohits entered by name have no portal assignment.
+
+## Container for a persistent-volume host
+
+Build this repository using its Dockerfile. Mount a persistent volume at /data writable by UID 10001. The container uses /data/bookings.sqlite, defaults to port 8000 and honors PORT. Expose it behind HTTPS and configure /api/health as the readiness endpoint. Set BOOKING_ADMIN_PASSWORD with a unique password of at least 16 characters in your host's secret settings. The container enables secure session cookies by default.
+
+Point the React Vercel project BOOKING_API_URL at this service's HTTPS origin. SQLite files and .env files are excluded from the container build.
+
+## Vercel backend
+
+Create a separate FastAPI project from this repository and connect a dedicated PostgreSQL database in Vercel Storage. Vercel can supply DATABASE_URL, or you can set BOOKING_DATABASE_URL explicitly. Set BOOKING_ADMIN_PASSWORD as a sensitive variable on the backend project, with at least 16 characters. Use the HTTPS backend origin as BOOKING_API_URL on the existing Vite project.
+
+PostgreSQL tables are created on startup. The Vercel deployment requires PostgreSQL, while local runs still default to SQLite. Connecting a new database starts with an empty account and booking list. Existing SQLite records need a separate data migration if they are to be transferred. Verify a preview with synthetic data before routing production traffic to it.

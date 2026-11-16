@@ -1,7 +1,6 @@
 from contextlib import closing
 import json
 import secrets
-import sqlite3
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -98,13 +97,14 @@ def admin_directory(store, require_staff):
                  search: str = Query(default="", max_length=100)):
         if not 0 < before <= 9_007_199_254_740_991:
             raise HTTPException(400, "Invalid page cursor")
-        needle = search.strip().lower()
+        needle = search.strip().lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
+        pattern = f"%{needle}%"
         with closing(store.connect()) as db:
             rows = db.execute(
                 SELECT_DIRECTORY + f"""WHERE {ROLE} = ? AND c.rowid < ?
-                AND (? = '' OR instr(lower(c.name), ?) > 0 OR instr(c.email, ?) > 0)
+                AND (lower(c.name) LIKE ? ESCAPE '!' OR c.email LIKE ? ESCAPE '!')
                 ORDER BY c.rowid DESC LIMIT 31""",
-                (role, before, needle, needle, needle),
+                (role, before, pattern, pattern),
             ).fetchall()
         return {"records": [account_result(row) for row in rows[:30]],
                 "next": rows[29]["cursor"] if len(rows) > 30 else None}
@@ -114,16 +114,16 @@ def admin_directory(store, require_staff):
         salt = secrets.token_bytes(16)
         password = hash_password(data.password, salt)
         user_id = secrets.token_hex(16)
-        try:
-            with store.write() as db:
-                db.execute(
-                    "INSERT INTO customers (id, email, name, salt, password_hash) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, data.email, data.name, salt, password),
-                )
-                save_profile(db, user_id, "purohit", data)
-                return account_result(db.execute(SELECT_DIRECTORY + "WHERE c.id = ?", (user_id,)).fetchone())
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(409, "This email is already in use") from exc
+        with store.write() as db:
+            result = db.execute(
+                """INSERT INTO customers (id, email, name, salt, password_hash) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(email) DO NOTHING""",
+                (user_id, data.email, data.name, salt, password),
+            )
+            if not result.rowcount:
+                raise HTTPException(409, "This email is already in use")
+            save_profile(db, user_id, "purohit", data)
+            return account_result(db.execute(SELECT_DIRECTORY + "WHERE c.id = ?", (user_id,)).fetchone())
 
     @router.patch("/{role}/{user_id}")
     def update_account(role: Literal["customer", "purohit"], user_id: Code, data: DirectoryUpdate):
@@ -133,20 +133,20 @@ def admin_directory(store, require_staff):
             raise HTTPException(422, "Use the customer password recovery process")
         salt = secrets.token_bytes(16) if data.password else None
         password = hash_password(data.password, salt) if salt else None
-        try:
-            with store.write() as db:
-                old = db.execute(SELECT_DIRECTORY + f"WHERE c.id = ? AND {ROLE} = ?", (user_id, role)).fetchone()
-                if old is None:
-                    raise HTTPException(404, "Account not found")
-                db.execute("UPDATE customers SET name = ?, email = ? WHERE id = ?", (data.name, data.email, user_id))
-                save_profile(db, user_id, role, data)
-                if password:
-                    db.execute("UPDATE customers SET salt = ?, password_hash = ? WHERE id = ?", (salt, password, user_id))
-                if password or not data.active or old["email"] != data.email:
-                    db.execute("DELETE FROM customer_sessions WHERE customer_id = ?", (user_id,))
-                return account_result(db.execute(SELECT_DIRECTORY + "WHERE c.id = ?", (user_id,)).fetchone())
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(409, "This email is already in use") from exc
+        with store.write() as db:
+            old = db.execute(SELECT_DIRECTORY + f"WHERE c.id = ? AND {ROLE} = ?", (user_id, role)).fetchone()
+            if old is None:
+                raise HTTPException(404, "Account not found")
+            duplicate = db.execute("SELECT 1 FROM customers WHERE email = ? AND id <> ?", (data.email, user_id)).fetchone()
+            if duplicate:
+                raise HTTPException(409, "This email is already in use")
+            db.execute("UPDATE customers SET name = ?, email = ? WHERE id = ?", (data.name, data.email, user_id))
+            save_profile(db, user_id, role, data)
+            if password:
+                db.execute("UPDATE customers SET salt = ?, password_hash = ? WHERE id = ?", (salt, password, user_id))
+            if password or not data.active or old["email"] != data.email:
+                db.execute("DELETE FROM customer_sessions WHERE customer_id = ?", (user_id,))
+            return account_result(db.execute(SELECT_DIRECTORY + "WHERE c.id = ?", (user_id,)).fetchone())
 
     return router
 
@@ -157,7 +157,7 @@ def save_profile(db, user_id, role, data):
     db.execute(
         """INSERT INTO account_directory (customer_id, role, active, phone, area) VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(customer_id) DO UPDATE SET active = excluded.active, phone = excluded.phone, area = excluded.area""",
-        (user_id, role, data.active, phone, area),
+        (user_id, role, int(data.active), phone, area),
     )
 
 

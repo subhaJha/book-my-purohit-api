@@ -1,11 +1,10 @@
-from contextlib import asynccontextmanager, closing, contextmanager
+from contextlib import asynccontextmanager, closing
 from hashlib import sha256
 import hmac
 import json
 import os
 from pathlib import Path
 import secrets
-import sqlite3
 from threading import Lock
 from time import monotonic
 from typing import Annotated, Literal
@@ -16,6 +15,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .accounts import ACCOUNT_SCHEMA, account_routes, customer
+from .database import Database
 from .directory import DIRECTORY_SCHEMA, active_purohit, admin_directory, assignment, purohit_routes, set_assignment
 from .models import (
     STATUS, AcceptQuote, AdminUpdateResult, BookingId, BookingPage, Code, NewBooking,
@@ -52,51 +52,29 @@ def summary(row):
     }
 
 
-class Database:
-    def __init__(self, path: Path):
-        self.path = path
-
-    def connect(self):
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def initialize(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(self.connect()) as db, db:
-            db.execute("PRAGMA journal_mode = WAL")
-            db.execute(SCHEMA)
-            db.executescript(ACCOUNT_SCHEMA)
-            db.executescript(DIRECTORY_SCHEMA)
-
-    @contextmanager
-    def write(self):
-        with closing(self.connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            yield db
-
-    @staticmethod
-    def get(db, booking_id):
-        row = db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
-        if row is None:
-            raise HTTPException(404, "Booking not found")
-        return row
-
-    @classmethod
-    def update(cls, db, row, status, quote):
-        db.execute(
-            "UPDATE bookings SET status = ?, quote = ?, revision = revision + 1 WHERE id = ?",
-            (status, quote, row["id"]),
-        )
-        return summary(cls.get(db, row["id"]))
+def booking_row(db, booking_id):
+    row = db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Booking not found")
+    return row
 
 
-def create_app(database: Path | None = None, password: str | None = None) -> FastAPI:
-    store = Database(database or Path(os.getenv("BOOKING_DB") or ".data/bookings.sqlite"))
+def save_booking_status(db, row, status, quote):
+    db.execute(
+        "UPDATE bookings SET status = ?, quote = ?, revision = revision + 1 WHERE id = ?",
+        (status, quote, row["id"]),
+    )
+    return summary(booking_row(db, row["id"]))
+
+
+def create_app(database: Path | None = None, password: str | None = None, *, hosted: bool = False) -> FastAPI:
+    database_url = (os.getenv("BOOKING_DATABASE_URL") or os.getenv("DATABASE_URL")) if database is None else None
+    on_vercel = hosted or os.getenv("VERCEL") == "1"
+    store = Database(database or Path(os.getenv("BOOKING_DB") or ".data/bookings.sqlite"), database_url)
     password = os.getenv("BOOKING_ADMIN_PASSWORD", "") if password is None else password
     expected = sha256(password.encode()).digest() if len(password) >= 16 else None
     # Short passwords are opt-in for a local developer launch only.
-    local_password = os.getenv("BOOKING_LOCAL_ADMIN_PASSWORD", "") if password == "" else ""
+    local_password = os.getenv("BOOKING_LOCAL_ADMIN_PASSWORD", "") if password == "" and not on_vercel else ""
     local_expected = sha256(local_password.encode()).digest() if local_password else None
     bearer = HTTPBearer(auto_error=False)
     rates = {}
@@ -105,7 +83,9 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
 
     @asynccontextmanager
     async def lifespan(_app):
-        store.initialize()
+        if on_vercel and not database_url and database is None:
+            raise RuntimeError("Set a persistent PostgreSQL DATABASE_URL for the Vercel backend.")
+        store.initialize(SCHEMA, ACCOUNT_SCHEMA, DIRECTORY_SCHEMA)
         yield
 
     app = FastAPI(title="Book My Purohit API", version="1.0.0", lifespan=lifespan)
@@ -189,13 +169,13 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
     def get_booking(booking_id: Code, request: Request):
         limit(request, "lookup", 180)
         with closing(store.connect()) as db:
-            return summary(store.get(db, booking_id))
+            return summary(booking_row(db, booking_id))
 
     @app.post("/api/bookings/{booking_id}/accept", response_model=PublicBooking)
     def accept_quote(booking_id: Code, data: AcceptQuote, request: Request):
         limit(request, "accept", 40)
         with store.write() as db:
-            row = store.get(db, booking_id)
+            row = booking_row(db, booking_id)
             if row["status"] == "confirmed" and data.revision == row["revision"] - 1:
                 return summary(row)
             if (row["status"] != "quoted" or row["revision"] != data.revision
@@ -204,7 +184,7 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
             purohit_id = assignment(db, booking_id)
             if purohit_id and not active_purohit(db, purohit_id):
                 raise HTTPException(409, "Assigned purohit is no longer available")
-            return store.update(db, row, "confirmed", row["quote"])
+            return save_booking_status(db, row, "confirmed", row["quote"])
 
     @app.get("/api/admin", response_model=BookingPage, dependencies=[Depends(require_staff)])
     def list_bookings(
@@ -215,7 +195,7 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
             rows = db.execute(
                 """SELECT b.rowid AS cursor, b.*, a.purohit_id FROM bookings b
                    LEFT JOIN booking_assignments a ON a.booking_id = b.id
-                   WHERE b.rowid < ? AND (? IS NULL OR b.status = ?)
+                   WHERE b.rowid < ? AND (CAST(? AS TEXT) IS NULL OR b.status = ?)
                    ORDER BY b.rowid DESC LIMIT 51""",
                 (before, status or None, status),
             ).fetchall()
@@ -230,7 +210,7 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
     @app.patch("/api/admin/{booking_id}", response_model=AdminUpdateResult, dependencies=[Depends(require_staff)])
     def update_booking(booking_id: Code, data: UpdateBooking):
         with store.write() as db:
-            row = store.get(db, booking_id)
+            row = booking_row(db, booking_id)
             if row["revision"] != data.revision or data.status not in TRANSITIONS.get(row["status"], set()):
                 raise HTTPException(409, "Booking has changed")
             quote = row["quote"]
@@ -244,7 +224,7 @@ def create_app(database: Path | None = None, password: str | None = None) -> Fas
                     data.quote.purohit = purohit["name"]
                 set_assignment(db, booking_id, purohit_id)
                 quote = data.quote.model_dump_json()
-            return dict(store.update(db, row, data.status, quote), purohitId=purohit_id)
+            return dict(save_booking_status(db, row, data.status, quote), purohitId=purohit_id)
 
     return app
 

@@ -82,7 +82,7 @@ def customer(db, request, role="customer"):
 
 
 def cookie_is_secure(request):
-    return request.url.scheme == "https" or os.getenv("BOOKING_SECURE_COOKIES") == "1"
+    return request.url.scheme == "https" or os.getenv("BOOKING_SECURE_COOKIES") == "1" or os.getenv("VERCEL") == "1"
 
 
 def start_session(db, request, response, user_id, role="customer"):
@@ -140,7 +140,8 @@ def account_routes(store, limit, booking_summary):
         user_id = secrets.token_hex(16)
         with store.write() as db:
             result = db.execute(
-                "INSERT OR IGNORE INTO customers (id, email, name, salt, password_hash) VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO customers (id, email, name, salt, password_hash) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(email) DO NOTHING""",
                 (user_id, data.email, data.name, salt, password_hash),
             )
             if not result.rowcount:

@@ -3,3 +3,4 @@ pydantic==2.14.3
 uvicorn==0.54.0
 tzdata==2026.6
 psycopg[binary]==3.3.9
+psycopg_pool==3.3.3

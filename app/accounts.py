@@ -1,4 +1,3 @@
-from contextlib import closing
 from hashlib import pbkdf2_hmac, sha256
 from hmac import compare_digest
 import os
@@ -98,7 +97,7 @@ def start_session(db, request, response, user_id, role="customer"):
 
 def authenticate(store, limit, data, request, response, role):
     limit(request, f"{role}_login", 15)
-    with closing(store.connect()) as db:
+    with store.connect() as db:
         user = db.execute(
             """SELECT c.*, COALESCE(d.role, 'customer') AS role, COALESCE(d.active, 1) AS active
                FROM customers c LEFT JOIN account_directory d ON d.customer_id = c.id WHERE c.email = ?""",
@@ -159,7 +158,9 @@ def account_routes(store, limit, booking_summary):
 
     @router.get("")
     def account(request: Request):
-        with closing(store.connect()) as db:
+        if session_digest(request) is None:
+            raise HTTPException(401, "Sign in required")
+        with store.connect() as db:
             user = customer(db, request)
             if user is None:
                 raise HTTPException(401, "Sign in required")
@@ -169,7 +170,7 @@ def account_routes(store, limit, booking_summary):
     def history(request: Request, before: int = 9_007_199_254_740_991):
         if not 0 < before <= 9_007_199_254_740_991:
             raise HTTPException(400, "Invalid page cursor")
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             user = customer(db, request)
             if user is None:
                 raise HTTPException(401, "Sign in required")
@@ -188,5 +189,5 @@ def account_routes(store, limit, booking_summary):
 
 
 def customer_exists(store, email):
-    with closing(store.connect()) as db:
+    with store.connect() as db:
         return db.execute("SELECT 1 FROM customers WHERE email = ?", (email,)).fetchone() is not None

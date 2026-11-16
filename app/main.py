@@ -1,4 +1,4 @@
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from hashlib import sha256
 import hmac
 import json
@@ -85,8 +85,11 @@ def create_app(database: Path | None = None, password: str | None = None, *, hos
     async def lifespan(_app):
         if on_vercel and not database_url and database is None:
             raise RuntimeError("Set a persistent PostgreSQL DATABASE_URL for the Vercel backend.")
-        store.initialize(SCHEMA, ACCOUNT_SCHEMA, DIRECTORY_SCHEMA)
-        yield
+        try:
+            store.initialize(SCHEMA, ACCOUNT_SCHEMA, DIRECTORY_SCHEMA)
+            yield
+        finally:
+            store.close()
 
     app = FastAPI(title="Book My Purohit API", version="1.0.0", lifespan=lifespan)
 
@@ -142,7 +145,7 @@ def create_app(database: Path | None = None, password: str | None = None, *, hos
 
     @app.get("/api/health")
     def health():
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             db.execute("SELECT 1 FROM bookings LIMIT 1").fetchone()
         return {"status": "ok"}
 
@@ -168,7 +171,7 @@ def create_app(database: Path | None = None, password: str | None = None, *, hos
     @app.get("/api/bookings/{booking_id}", response_model=PublicBooking)
     def get_booking(booking_id: Code, request: Request):
         limit(request, "lookup", 180)
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             return summary(booking_row(db, booking_id))
 
     @app.post("/api/bookings/{booking_id}/accept", response_model=PublicBooking)
@@ -191,7 +194,7 @@ def create_app(database: Path | None = None, password: str | None = None, *, hos
         before: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)] = 9_007_199_254_740_991,
         status: STATUS | Literal[""] | None = None,
     ):
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             rows = db.execute(
                 """SELECT b.rowid AS cursor, b.*, a.purohit_id FROM bookings b
                    LEFT JOIN booking_assignments a ON a.booking_id = b.id

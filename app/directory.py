@@ -1,4 +1,3 @@
-from contextlib import closing
 import json
 import secrets
 from typing import Literal
@@ -6,7 +5,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import Field, model_validator
 
-from .accounts import Credentials, Identity, authenticate, customer, end_session, hash_password
+from .accounts import Credentials, Identity, authenticate, customer, end_session, hash_password, session_digest
 from .models import AREA, Code
 
 DIRECTORY_SCHEMA = """
@@ -84,7 +83,7 @@ def admin_directory(store, require_staff):
 
     @router.get("/roster")
     def roster():
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             rows = db.execute(
                 """SELECT c.id, c.name, d.area FROM customers c
                    JOIN account_directory d ON d.customer_id = c.id
@@ -99,7 +98,7 @@ def admin_directory(store, require_staff):
             raise HTTPException(400, "Invalid page cursor")
         needle = search.strip().lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")
         pattern = f"%{needle}%"
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             rows = db.execute(
                 SELECT_DIRECTORY + f"""WHERE {ROLE} = ? AND c.rowid < ?
                 AND (lower(c.name) LIKE ? ESCAPE '!' OR c.email LIKE ? ESCAPE '!')
@@ -174,9 +173,11 @@ def purohit_routes(store, limit, summary):
 
     @router.get("/schedule")
     def schedule(request: Request, before: int = 9_007_199_254_740_991):
+        if session_digest(request, "purohit") is None:
+            raise HTTPException(401, "Sign in to the purohit portal")
         if not 0 < before <= 9_007_199_254_740_991:
             raise HTTPException(400, "Invalid page cursor")
-        with closing(store.connect()) as db:
+        with store.connect() as db:
             user = customer(db, request, "purohit")
             if user is None:
                 raise HTTPException(401, "Sign in to the purohit portal")
